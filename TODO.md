@@ -1,6 +1,6 @@
 ## server.py
 
-- `handle_client` only reads one message per connection This is fine given your protocol (one request per connection), but it means a new TCP connection is opened for every heartbeat every 5 seconds. For a student project this is acceptable, but a persistent connection with multiplexed requests would be more efficient at scale.
+- `handle_client` only reads one message per connection This is fine given your protocol (one request per connection), but it means a new TCP connection is opened for every heartbeat every 5 seconds. For this project this is acceptable, but a persistent connection with multiplexed requests would be more efficient at scale.
 
 ## Tests:
 
