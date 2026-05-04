@@ -56,19 +56,34 @@ class IndexState:
             self._remove_peer_locked(peer_id)
             return True
 
-    def search(self, filename):
+    # def search(self, filename):
+    #     with self.lock:
+    #         entries = self.file_index.get(filename, {})
+    #         results = []
+    #         for info in entries.values():
+    #             results.append(
+    #                 {
+    #                     "ip": info["ip"],
+    #                     "port": info["port"],
+    #                     "filename": filename,
+    #                     "size": info["size"],
+    #                 }
+    #             )
+    #         return results
+
+    ## Updated with Keyword search. 
+        
+    def search(self, query):
         with self.lock:
-            entries = self.file_index.get(filename, {})
             results = []
-            for info in entries.values():
-                results.append(
-                    {
-                        "ip": info["ip"],
-                        "port": info["port"],
-                        "filename": filename,
-                        "size": info["size"],
-                    }
-                )
+            query_lower = query.lower()
+            for filename, entries in self.file_index.items():
+                if query_lower in filename.lower():
+                    for info in entries.values():
+                        results.append({
+                            "ip": info["ip"], "port": info["port"],
+                            "filename": filename, "size": info["size"],
+                        })
             return results
 
     def cleanup(self, timeout_sec):

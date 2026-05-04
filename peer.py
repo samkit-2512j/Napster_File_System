@@ -82,13 +82,15 @@ def deregister(host, port, listen_port):
 
 
 def heartbeat_loop(host, port, listen_port, stop_event):
+    failures = 0
     while not stop_event.is_set():
         try:
             ok = send_heartbeat(host, port, listen_port)
-            if not ok:
-                print("Heartbeat rejected by server.")
+            failures = 0 if ok else failures + 1
         except Exception:
-            print("Heartbeat failed.")
+            failures += 1
+        if failures >= 3:
+            print("WARNING: Lost contact with index server.")
         stop_event.wait(HEARTBEAT_INTERVAL)
 
 
@@ -118,7 +120,17 @@ def download_from_peer(peer, filename, download_dir):
             print("Download failed: missing size")
             return False
         destination = unique_download_path(download_dir, filename)
-        receive_to_file(sock, destination, size)
+
+        # receive_to_file(sock, destination, size)
+
+        # Added temp file handling to avoid leaving partial files on failure
+        tmp_path = destination.with_suffix(".tmp")
+        try:
+            receive_to_file(sock, tmp_path, size)
+            tmp_path.rename(destination)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
         print(f"Downloaded to {destination}")
         return True
 
