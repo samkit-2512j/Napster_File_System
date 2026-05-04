@@ -1,3 +1,4 @@
+import ipaddress
 import socket
 import threading
 from pathlib import Path
@@ -50,9 +51,57 @@ def send_server_request(host, port, message, timeout=5):
         return recv_json(sock)
 
 
-def register_with_server(host, port, listen_port, shared_dir):
+def _is_loopback(value):
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return True
+
+
+def detect_advertised_ip(server_host):
+    candidates = []
+
+    def add_candidate(value):
+        if value and value not in candidates:
+            candidates.append(value)
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect((server_host, 1))
+            add_candidate(sock.getsockname()[0])
+    except OSError:
+        pass
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            add_candidate(sock.getsockname()[0])
+    except OSError:
+        pass
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            add_candidate(info[4][0])
+    except OSError:
+        pass
+
+    for candidate in candidates:
+        if not _is_loopback(candidate):
+            return candidate
+    return candidates[0] if candidates else "127.0.0.1"
+
+
+def register_with_server(host, port, listen_port, shared_dir, advertised_ip, username):
     files = list_shared_files(shared_dir)
-    message = make_request("REGISTER", {"listen_port": listen_port, "files": files})
+    message = make_request(
+        "REGISTER",
+        {
+            "listen_port": listen_port,
+            "listen_ip": advertised_ip,
+            "files": files,
+            "username": username,
+        },
+    )
     response = send_server_request(host, port, message)
     return response, files
 
@@ -67,25 +116,41 @@ def search_server(host, port, query):
     return payload.get("results", [])
 
 
-def send_heartbeat(host, port, listen_port):
-    message = make_request("HEARTBEAT", {"listen_port": listen_port})
+def list_all_files(host, port):
+    message = make_request("LIST")
+    response = send_server_request(host, port, message)
+    if response.get("status") != "OK":
+        print(f"List failed: {response.get('error', 'unknown error')}")
+        return []
+    payload = response.get("payload") or {}
+    return payload.get("results", [])
+
+
+def send_heartbeat(host, port, listen_port, advertised_ip):
+    message = make_request(
+        "HEARTBEAT",
+        {"listen_port": listen_port, "listen_ip": advertised_ip},
+    )
     response = send_server_request(host, port, message)
     return response.get("status") == "OK"
 
 
-def deregister(host, port, listen_port):
-    message = make_request("DEREGISTER", {"listen_port": listen_port})
+def deregister(host, port, listen_port, advertised_ip):
+    message = make_request(
+        "DEREGISTER",
+        {"listen_port": listen_port, "listen_ip": advertised_ip},
+    )
     try:
         send_server_request(host, port, message)
     except Exception:
         return
 
 
-def heartbeat_loop(host, port, listen_port, stop_event):
+def heartbeat_loop(host, port, listen_port, advertised_ip, stop_event):
     failures = 0
     while not stop_event.is_set():
         try:
-            ok = send_heartbeat(host, port, listen_port)
+            ok = send_heartbeat(host, port, listen_port, advertised_ip)
             failures = 0 if ok else failures + 1
         except Exception:
             failures += 1
@@ -196,18 +261,57 @@ def print_results(results):
         print(f"{idx}. {entry['filename']} - {size} @ {entry['ip']}:{entry['port']}")
 
 
+def build_catalog(results):
+    catalog = {}
+    for entry in results:
+        filename = entry.get("filename")
+        size = entry.get("size")
+        if not filename or not isinstance(size, int):
+            continue
+        record = catalog.setdefault(
+            filename,
+            {"filename": filename, "size": size, "peers": []},
+        )
+        record["peers"].append(
+            {
+                "ip": entry.get("ip"),
+                "port": entry.get("port"),
+                "size": size,
+                "username": entry.get("username"),
+            }
+        )
+    return sorted(catalog.values(), key=lambda item: item["filename"].lower())
+
+
+def print_catalog(catalog):
+    for idx, entry in enumerate(catalog, start=1):
+        size = format_size(entry["size"])
+        peer_count = len(entry["peers"])
+        suffix = f" ({peer_count} peers)" if peer_count > 1 else ""
+        print(f"{idx}. {entry['filename']} - {size}{suffix}")
+
+
+def filter_catalog(catalog, query):
+    query_lower = query.lower()
+    return [entry for entry in catalog if entry["filename"].lower().startswith(query_lower)]
+
+
 def main():
     server_host = input("Index server host [127.0.0.1]: ").strip() or "127.0.0.1"
     server_port = prompt_int("Index server port [9000]: ", 9000)
+    username = input("Username: ").strip()
     listen_port = prompt_int("Peer listen port [0 for auto]: ", 0)
     shared_dir = input("Shared folder path [.] : ").strip() or "."
     download_dir = input("Download folder [downloads]: ").strip() or "downloads"
 
     stop_event = threading.Event()
     actual_port, server_thread = start_file_server(shared_dir, listen_port, stop_event)
+    advertised_ip = detect_advertised_ip(server_host)
 
     try:
-        response, files = register_with_server(server_host, server_port, actual_port, shared_dir)
+        response, files = register_with_server(
+            server_host, server_port, actual_port, shared_dir, advertised_ip, username
+        )
         if response.get("status") != "OK":
             print(f"Registration failed: {response.get('error', 'unknown error')}")
             return
@@ -217,23 +321,25 @@ def main():
         return
 
     heartbeat_thread = threading.Thread(
-        target=heartbeat_loop, args=(server_host, server_port, actual_port, stop_event), daemon=True
+        target=heartbeat_loop,
+        args=(server_host, server_port, actual_port, advertised_ip, stop_event),
+        daemon=True,
     )
     heartbeat_thread.start()
 
-    last_results = []
     while True:
         print("\nMenu")
         print("1. Refresh share list")
-        print("2. Search for a file")
-        print("3. Download from peer")
-        print("4. List shared files")
-        print("5. Exit")
+        print("2. Download")
+        print("3. List shared files")
+        print("4. Exit")
         choice = input("Select: ").strip()
 
         if choice == "1":
             try:
-                response, files = register_with_server(server_host, server_port, actual_port, shared_dir)
+                response, files = register_with_server(
+                    server_host, server_port, actual_port, shared_dir, advertised_ip, username
+                )
                 if response.get("status") == "OK":
                     print(f"Updated share list ({len(files)} files).")
                 else:
@@ -242,31 +348,58 @@ def main():
                 print(f"Update failed: {exc}")
 
         elif choice == "2":
-            query = input("Filename to search: ").strip()
-            if not query:
-                continue
             try:
-                last_results = search_server(server_host, server_port, query)
-                print_results(last_results)
+                results = list_all_files(server_host, server_port)
             except Exception as exc:
-                print(f"Search failed: {exc}")
-
-        elif choice == "3":
-            if not last_results:
-                print("No cached results. Search first.")
+                print(f"List failed: {exc}")
                 continue
-            selection = prompt_int("Select result number: ", 0)
-            if selection < 1 or selection > len(last_results):
+            if not results:
+                print("No files available.")
+                continue
+            catalog = build_catalog(results)
+            print("\nAvailable files:")
+            print_catalog(catalog)
+
+            query = input("Filter by name (leave blank to skip): ").strip()
+            if query:
+                catalog = filter_catalog(catalog, query)
+                if not catalog:
+                    print("No matches found.")
+                    continue
+                print("\nMatches:")
+                print_catalog(catalog)
+
+            selection = prompt_int("Select file number: ", 0)
+            if selection < 1 or selection > len(catalog):
                 print("Invalid selection.")
                 continue
-            peer = last_results[selection - 1]
-            filename = peer["filename"]
+
+            entry = catalog[selection - 1]
+            filename = entry["filename"]
+            peers = entry["peers"]
+            if len(peers) == 1:
+                try:
+                    download_from_peer(peers[0], filename, download_dir)
+                except Exception as exc:
+                    print(f"Download failed: {exc}")
+                continue
+
+            print("\nFile is available on multiple peers:")
+            for idx, peer in enumerate(peers, start=1):
+                label = f"{peer['ip']}:{peer['port']}"
+                if peer.get("username"):
+                    label = f"{label} ({peer['username']})"
+                print(f"{idx}. {label}")
+            peer_choice = prompt_int("Select peer number: ", 0)
+            if peer_choice < 1 or peer_choice > len(peers):
+                print("Invalid selection.")
+                continue
             try:
-                download_from_peer(peer, filename, download_dir)
+                download_from_peer(peers[peer_choice - 1], filename, download_dir)
             except Exception as exc:
                 print(f"Download failed: {exc}")
 
-        elif choice == "4":
+        elif choice == "3":
             files = list_shared_files(shared_dir)
             if not files:
                 print("No shared files found.")
@@ -274,14 +407,14 @@ def main():
             for entry in files:
                 print(f"- {entry['name']} ({format_size(entry['size'])})")
 
-        elif choice == "5":
+        elif choice == "4":
             break
 
         else:
             print("Unknown option.")
 
     stop_event.set()
-    deregister(server_host, server_port, actual_port)
+    deregister(server_host, server_port, actual_port, advertised_ip)
     server_thread.join(timeout=2)
     heartbeat_thread.join(timeout=2)
 

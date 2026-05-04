@@ -1,4 +1,5 @@
 import argparse
+import ipaddress
 import socket
 import threading
 import time
@@ -15,7 +16,7 @@ class IndexState:
         self.peers = {}
         self.file_index = {}
 
-    def register_peer(self, ip, port, files):
+    def register_peer(self, ip, port, files, username):
         peer_id = f"{ip}:{port}"
         with self.lock:
             self._remove_peer_locked(peer_id)
@@ -30,11 +31,13 @@ class IndexState:
                     "ip": ip,
                     "port": port,
                     "size": size,
+                    "username": username,
                 }
             self.peers[peer_id] = {
                 "ip": ip,
                 "port": port,
                 "files": file_map,
+                "username": username,
                 "last_seen": time.time(),
             }
         return peer_id
@@ -78,12 +81,25 @@ class IndexState:
             results = []
             query_lower = query.lower()
             for filename, entries in self.file_index.items():
-                if query_lower in filename.lower():
+                if filename.lower().startswith(query_lower):
                     for info in entries.values():
                         results.append({
                             "ip": info["ip"], "port": info["port"],
                             "filename": filename, "size": info["size"],
+                            "username": info.get("username"),
                         })
+            return results
+
+    def list_all(self):
+        with self.lock:
+            results = []
+            for filename, entries in self.file_index.items():
+                for info in entries.values():
+                    results.append({
+                        "ip": info["ip"], "port": info["port"],
+                        "filename": filename, "size": info["size"],
+                        "username": info.get("username"),
+                    })
             return results
 
     def cleanup(self, timeout_sec):
@@ -108,6 +124,30 @@ class IndexState:
         del self.peers[peer_id]
 
 
+def _is_usable_ip(value):
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    if ip.is_unspecified:
+        return False
+    return True
+
+
+def _select_peer_ip(addr_ip, advertised_ip):
+    candidates = []
+    if advertised_ip:
+        candidates.append(advertised_ip)
+    candidates.append(addr_ip)
+    for candidate in candidates:
+        if not _is_usable_ip(candidate):
+            continue
+        ip = ipaddress.ip_address(candidate)
+        if not ip.is_loopback:
+            return candidate
+    return addr_ip
+
+
 def handle_client(conn, addr, state):
     with conn:
         try:
@@ -122,6 +162,8 @@ def handle_client(conn, addr, state):
         if msg_type == "REGISTER":
             listen_port = int(payload.get("listen_port", 0))
             files = payload.get("files", [])
+            advertised_ip = payload.get("listen_ip") or payload.get("advertised_ip")
+            username = payload.get("username")
             if listen_port <= 0:
                 send_json(conn, make_response(request_id, "ERROR", error="listen_port required"))
                 return
@@ -134,7 +176,8 @@ def handle_client(conn, addr, state):
                 if not name or not isinstance(size, int):
                     continue
                 cleaned.append({"name": name, "size": size})
-            peer_id = state.register_peer(addr[0], listen_port, cleaned)
+            peer_ip = _select_peer_ip(addr[0], advertised_ip)
+            peer_id = state.register_peer(peer_ip, listen_port, cleaned, username)
             send_json(conn, make_response(request_id, "OK", {"peer_id": peer_id}))
             return
 
@@ -147,12 +190,19 @@ def handle_client(conn, addr, state):
             send_json(conn, make_response(request_id, "OK", {"results": results}))
             return
 
+        if msg_type == "LIST":
+            results = state.list_all()
+            send_json(conn, make_response(request_id, "OK", {"results": results}))
+            return
+
         if msg_type == "HEARTBEAT":
             listen_port = int(payload.get("listen_port", 0))
+            advertised_ip = payload.get("listen_ip") or payload.get("advertised_ip")
             if listen_port <= 0:
                 send_json(conn, make_response(request_id, "ERROR", error="listen_port required"))
                 return
-            if state.heartbeat(addr[0], listen_port):
+            peer_ip = _select_peer_ip(addr[0], advertised_ip)
+            if state.heartbeat(peer_ip, listen_port):
                 send_json(conn, make_response(request_id, "OK"))
             else:
                 send_json(conn, make_response(request_id, "ERROR", error="peer not registered"))
@@ -160,10 +210,12 @@ def handle_client(conn, addr, state):
 
         if msg_type == "DEREGISTER":
             listen_port = int(payload.get("listen_port", 0))
+            advertised_ip = payload.get("listen_ip") or payload.get("advertised_ip")
             if listen_port <= 0:
                 send_json(conn, make_response(request_id, "ERROR", error="listen_port required"))
                 return
-            if state.deregister(addr[0], listen_port):
+            peer_ip = _select_peer_ip(addr[0], advertised_ip)
+            if state.deregister(peer_ip, listen_port):
                 send_json(conn, make_response(request_id, "OK"))
             else:
                 send_json(conn, make_response(request_id, "ERROR", error="peer not registered"))
