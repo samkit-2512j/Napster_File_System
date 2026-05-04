@@ -51,6 +51,34 @@ class ServerStateTests(unittest.TestCase):
         self.assertIn("new.txt", state.file_index)
         self.assertNotIn("127.0.0.1:5000", state.file_index.get("old.txt", {}))
 
+    def test_register_peer_with_empty_file_list_still_registers_peer(self):
+        state = server.IndexState()
+
+        peer_id = state.register_peer("127.0.0.1", 5000, [])
+
+        self.assertEqual(peer_id, "127.0.0.1:5000")
+        self.assertIn(peer_id, state.peers)
+        self.assertEqual(state.peers[peer_id]["files"], {})
+        self.assertEqual(state.file_index, {})
+
+    def test_register_peer_skips_malformed_entries(self):
+        state = server.IndexState()
+
+        state.register_peer(
+            "127.0.0.1",
+            5000,
+            [
+                {"name": 123, "size": "big"},
+                {"name": "valid.txt", "size": 10},
+                {"name": "broken-size", "size": "10"},
+            ],
+        )
+
+        self.assertEqual(state.peers["127.0.0.1:5000"]["files"], {"valid.txt": 10})
+        self.assertIn("valid.txt", state.file_index)
+        self.assertNotIn(123, state.file_index)
+        self.assertNotIn("broken-size", state.file_index)
+
     def test_search_returns_matching_results_and_empty_for_unknown(self):
         state = server.IndexState()
         state.register_peer("127.0.0.1", 5000, [{"name": "alpha.txt", "size": 12}])
@@ -89,7 +117,7 @@ class ServerStateTests(unittest.TestCase):
         state = server.IndexState()
         state.register_peer("127.0.0.1", 5000, [{"name": "old.txt", "size": 1}])
 
-        self.current_time = 1005.0
+        self.current_time = 1010.0
         state.register_peer("127.0.0.2", 5001, [{"name": "fresh.txt", "size": 2}])
 
         self.current_time = 1020.0

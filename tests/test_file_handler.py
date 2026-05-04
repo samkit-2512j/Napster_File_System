@@ -15,6 +15,11 @@ import file_handler
 
 
 class FileHandlerTests(unittest.TestCase):
+    def test_list_shared_files_returns_empty_for_empty_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = file_handler.list_shared_files(temp_dir)
+            self.assertEqual(result, [])
+
     def test_list_shared_files_returns_name_and_size(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             file_path = Path(temp_dir) / "example.txt"
@@ -44,6 +49,17 @@ class FileHandlerTests(unittest.TestCase):
 
             self.assertEqual(result, [])
 
+    def test_list_shared_files_skips_subdirectories(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            nested = Path(temp_dir) / "nested"
+            nested.mkdir()
+            file_path = Path(temp_dir) / "keep.txt"
+            file_path.write_text("ok")
+
+            result = file_handler.list_shared_files(temp_dir)
+
+            self.assertEqual(result, [{"name": "keep.txt", "size": 2}])
+
     def test_get_file_path_rejects_path_traversal_attempts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             for filename in ["../secret", "a/b", "a\\b"]:
@@ -53,6 +69,11 @@ class FileHandlerTests(unittest.TestCase):
     def test_get_file_path_returns_none_for_nonexistent_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             self.assertIsNone(file_handler.get_file_path(temp_dir, "missing.txt"))
+
+    def test_get_file_path_returns_none_for_none_or_empty_filename(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.assertIsNone(file_handler.get_file_path(temp_dir, None))
+            self.assertIsNone(file_handler.get_file_path(temp_dir, ""))
 
     def test_get_file_path_returns_valid_path(self):
         with tempfile.TemporaryDirectory() as temp_dir:

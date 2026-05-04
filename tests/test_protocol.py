@@ -49,6 +49,15 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             protocol.recv_json(receiver)
 
+    def test_send_json_raises_when_message_is_too_large(self):
+        sender, receiver = socket.socketpair()
+        self.addCleanup(sender.close)
+        self.addCleanup(receiver.close)
+
+        with patch.object(protocol, "MAX_MESSAGE_SIZE", 16):
+            with self.assertRaises(ValueError):
+                protocol.send_json(sender, {"type": "PING", "payload": {"text": "x" * 200}})
+
     def test_make_request_generates_unique_request_ids(self):
         with patch("protocol.uuid.uuid4", side_effect=["first", "second"]):
             first = protocol.make_request("PING")

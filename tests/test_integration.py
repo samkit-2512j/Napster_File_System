@@ -55,6 +55,16 @@ def start_peer_server(shared_dir):
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_register_with_listen_port_zero_returns_error(self):
+        index_server = IndexServerHarness()
+        self.addCleanup(index_server.close)
+
+        request = protocol.make_request("REGISTER", {"listen_port": 0, "files": []})
+        response = peer.send_server_request(index_server.host, index_server.port, request)
+
+        self.assertEqual(response["status"], "ERROR")
+        self.assertEqual(response["error"], "listen_port required")
+
     def test_full_register_search_download_flow(self):
         index_server = IndexServerHarness()
         self.addCleanup(index_server.close)
@@ -165,6 +175,33 @@ class IntegrationTests(unittest.TestCase):
                 self.assertEqual(response["status"], "ERROR")
                 self.assertEqual(sock.recv(1), b"")
 
+    def test_download_request_rejects_path_traversal_filename(self):
+        with tempfile.TemporaryDirectory() as shared_dir:
+            safe_file = Path(shared_dir) / "safe.txt"
+            safe_file.write_text("safe")
+            port, stop_event, thread = start_peer_server(shared_dir)
+            self.addCleanup(stop_event.set)
+            self.addCleanup(thread.join, 2)
+
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+                protocol.send_json(sock, protocol.make_request("DOWNLOAD_REQUEST", {"filename": "../etc/passwd"}))
+                response = protocol.recv_json(sock)
+                self.assertEqual(response["status"], "ERROR")
+                self.assertEqual(response["error"], "file not found")
+                self.assertEqual(sock.recv(1), b"")
+
+    def test_server_handles_connect_and_immediate_close(self):
+        index_server = IndexServerHarness()
+        self.addCleanup(index_server.close)
+
+        with socket.create_connection((index_server.host, index_server.port), timeout=5):
+            pass
+
+        request = protocol.make_request("SEARCH", {"query": "anything"})
+        response = peer.send_server_request(index_server.host, index_server.port, request)
+        self.assertEqual(response["status"], "OK")
+        self.assertEqual(response.get("payload", {}).get("results"), [])
+
     def test_concurrent_downloads_from_same_peer_complete_correctly(self):
         index_server = IndexServerHarness()
         self.addCleanup(index_server.close)
@@ -201,6 +238,8 @@ class IntegrationTests(unittest.TestCase):
             thread_a.join(timeout=5)
             thread_b.join(timeout=5)
 
+            self.assertFalse(thread_a.is_alive(), "Download thread A timed out")
+            self.assertFalse(thread_b.is_alive(), "Download thread B timed out")
             self.assertFalse(errors)
             self.assertEqual((Path(download_a) / "shared.bin").read_bytes(), payload)
             self.assertEqual((Path(download_b) / "shared.bin").read_bytes(), payload)
@@ -236,6 +275,7 @@ class IntegrationTests(unittest.TestCase):
         thread.join(timeout=2)
         self.assertFalse(thread.is_alive())
         client_sock.settimeout(1)
+        # b"" means the server closed the connection without sending a response body.
         self.assertEqual(client_sock.recv(1), b"")
 
 
